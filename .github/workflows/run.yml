@@ -1,0 +1,185 @@
+name: Run Service
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily self-trigger at 08:30 Beijing time (UTC+8)
+    - cron: "30 0 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: run-group
+  cancel-in-progress: true
+
+env:
+  UPLOAD_API_TOKEN: ${{ secrets.UPLOAD_API_TOKEN }}
+  GH_OWNER: ${{ github.repository_owner }}
+  GH_REPO: ${{ github.event.repository.name }}
+  RUN_DURATION: 12600
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore DB from private git repo
+        run: |
+          git clone https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git db-repo || mkdir db-repo
+          mkdir -p data
+          if [ -f db-repo/data.zip ]; then
+            unzip -o db-repo/data.zip -d .
+            rm -rf data/logs data/bin
+            echo "DB and data restored from zip."
+          else
+            echo "Fresh start"
+          fi
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Download & extract 9router CLI
+        env:
+          GHCP_TOKEN: ${{ secrets.GHCP_TOKEN }}
+        run: |
+          echo "Resolving 9router CLI release asset (tag cli-latest)..."
+          ASSET_ID=$(curl -sf --retry 3 \
+            -H "Authorization: bearer $GHCP_TOKEN" \
+            https://api.github.com/repos/jjjjllll111/9router-private/releases/tags/cli-latest \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['assets'][0]['id'])")
+          echo "Downloading 9router-cli.tar.gz (asset $ASSET_ID)..."
+          curl -fL --retry 3 \
+            -H "Authorization: bearer $GHCP_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/jjjjllll111/9router-private/releases/assets/$ASSET_ID" \
+            -o 9router-cli.tar.gz
+          mkdir -p 9router-app
+          tar -xzf 9router-cli.tar.gz -C 9router-app
+          # Flatten if the archive contains a single top-level directory
+          shopt -s dotglob
+          entries=( 9router-app/* )
+          if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+            mv "${entries[0]}"/* 9router-app/
+            rmdir "${entries[0]}"
+          fi
+          ls -la 9router-app
+
+      - name: Start service
+        id: start
+        working-directory: 9router-app
+        run: |
+          export NINEROUTER_MAX_OLD_SPACE_SIZE=0
+          export DATA_DIR="$GITHUB_WORKSPACE/data" PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production
+          mkdir -p "$DATA_DIR"
+
+          echo "Starting 9router with bun..."
+          nohup bun cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &
+          APP_PID=$!
+          echo "pid=$APP_PID" >> $GITHUB_OUTPUT
+          sleep 3
+          for i in $(seq 1 10); do
+            curl -sf http://localhost:20128 > /dev/null 2>&1 && echo "Service ready!" && break
+            sleep 2
+          done
+
+      - name: Setup Cloudflare Tunnel
+        id: cloudflare
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          nohup cloudflared tunnel --no-autoupdate run --token ${{ secrets.CF_TUNNEL_TOKEN }} > /dev/null 2>&1 &
+          echo "$!" > /tmp/cloudflared.pid
+          sleep 5
+          echo "Tunnel started"
+
+      - name: Verify connectivity
+        continue-on-error: true
+        run: |
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -sk -o /dev/null -w '%{http_code}' "http://localhost:20128/" --max-time 10 2>/dev/null || true)
+            echo "Local check $i: HTTP $CODE"
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 500 ] 2>/dev/null; then
+              echo "Service accessible!"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Service failed to become accessible after 6 attempts!"
+          exit 1
+
+      - name: Keep alive + watchdog
+        run: |
+          upload_db() {
+            echo "[$(date)] DB upload..."
+            mkdir -p db-repo
+            zip -r db-repo/data.zip data/ -x "data/logs/*" "data/bin/*"
+            (cd db-repo
+              [ ! -d .git ] && git init && git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git checkout --orphan temp-branch 2>/dev/null || git checkout -b temp-branch
+              git add data.zip
+              git commit -m "backup" --allow-empty
+              git branch -M main
+              git push -f origin main
+            )
+          }
+
+          END=$((SECONDS + ${{ env.RUN_DURATION }}))
+          LAST_UPLOAD=0
+          while [ $SECONDS -lt $END ]; do
+            NOW=$(date +%s)
+
+            # Cloudflare tunnel health
+            CF_PID=$(cat /tmp/cloudflared.pid 2>/dev/null || echo 0)
+            if [ "$CF_PID" -gt 0 ] && ! kill -0 $CF_PID 2>/dev/null; then
+              echo "[$(date)] cloudflared died, restarting..."
+              nohup cloudflared tunnel --no-autoupdate run --token ${{ secrets.CF_TUNNEL_TOKEN }} > /dev/null 2>&1 &
+              echo "$!" > /tmp/cloudflared.pid
+              sleep 3
+            fi
+
+            # Service health
+            if ! curl -s http://localhost:20128 > /dev/null 2>&1; then
+              echo "[$(date)] Service died or unresponsive, restarting..."
+              echo "=== 9router Log ==="
+              cat 9router.log 2>/dev/null || true
+              echo "==================="
+              export NINEROUTER_MAX_OLD_SPACE_SIZE=0
+              export DATA_DIR="$GITHUB_WORKSPACE/data" PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production
+              (cd "$GITHUB_WORKSPACE/9router-app" && nohup bun cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &)
+              sleep 5
+            fi
+
+            # DB upload every 10 min
+            if [ $((NOW - LAST_UPLOAD)) -ge 600 ]; then
+              upload_db
+              LAST_UPLOAD=$NOW
+            fi
+
+            REMAINING=$((END - SECONDS))
+            echo "[$(date)] Remaining: $((REMAINING/3600))h $(((REMAINING%3600)/60))m"
+            sleep 30
+          done
+
+      - name: Final upload
+        if: always()
+        run: |
+          kill ${{ steps.start.outputs.pid }} 2>/dev/null || true
+          sleep 2
+          mkdir -p db-repo
+          zip -r db-repo/data.zip data/ -x "data/logs/*" "data/bin/*"
+          (cd db-repo
+            [ ! -d .git ] && git init && git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout --orphan temp-branch 2>/dev/null || git checkout -b temp-branch
+            git add data.zip
+            git commit -m "final backup" --allow-empty
+            git branch -M main
+            git push -f origin main
+          )
+          echo "=== Done ==="
+          # NOTE: next-run chaining is handled by relay.yml (workflow_run trigger).
+          # It dispatches run.yml again ONLY during Beijing time 10:00-22:00;
+          # outside that window the service stays down overnight.

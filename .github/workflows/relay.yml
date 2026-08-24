@@ -1,0 +1,31 @@
+name: WinRunner Relay
+
+on:
+  workflow_run:
+    workflows: ["Run Service"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+# no cancel-in-progress: failure-triggered skip must not cancel a success-triggered sleep
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Trigger next run
+        env:
+          GH_TOKEN: ${{ secrets.RELAY_PAT }}
+        run: |
+          set -Eeuo pipefail
+          echo "parent conclusion=${{ github.event.workflow_run.conclusion }} id=${{ github.event.workflow_run.id }}"
+          hour=$(date -u -d '+8 hours' +%-H)
+          if [ "$hour" -lt 10 ] || [ "$hour" -ge 22 ]; then
+            echo "[skip] Beijing hour=$hour outside 10-22; leaving service down"
+            exit 0
+          fi
+          echo "[ok] Beijing hour=$hour in 10-22 window"
+          gh workflow run run.yml -R "${{ github.repository }}" --ref main
+          echo "Next run triggered"
