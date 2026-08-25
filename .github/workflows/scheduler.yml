@@ -1,0 +1,50 @@
+name: Scheduler
+
+on:
+  schedule:
+    # Tick every 10 minutes; the guard below enforces the real window
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+concurrency:
+  group: scheduler-group
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Run Service if idle and inside window (Beijing 08:30-22:00)
+        env:
+          GH_TOKEN: ${{ secrets.RELAY_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+          h=$(date -u -d '+8 hours' +%-H)
+          m=$(date -u +%-M)
+          echo "[tick] Beijing time: ${h}:${m}"
+
+          # Window: 08:30 <= t < 22:00 Beijing
+          if [ "$h" -lt 8 ] || [ "$h" -ge 22 ]; then
+            echo "[skip] outside 08:30-22:00 window"
+            exit 0
+          fi
+          if [ "$h" -eq 8 ] && [ "$m" -lt 30 ]; then
+            echo "[skip] before 08:30"
+            exit 0
+          fi
+
+          # Skip if anything is already running or queued
+          active=$(gh api "repos/$REPO/actions/runs?per_page=1" \
+            --jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "pending")] | length')
+          echo "[tick] active/queued/pending runs: $active"
+          if [ "$active" -ne 0 ]; then
+            echo "[skip] a run is already active"
+            exit 0
+          fi
+
+          echo "[ok] idle inside window -> dispatching Run Service"
+          gh workflow run run.yml -R "$REPO" --ref main
