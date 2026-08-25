@@ -35,9 +35,6 @@ jobs:
             echo "Fresh start"
           fi
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-
       - name: Download & extract 9router CLI
         env:
           GHCP_TOKEN: ${{ secrets.GHCP_TOKEN }}
@@ -70,19 +67,18 @@ jobs:
             '  "version": "0.5.50",' \
             '  "dependencies": { "node-machine-id": "^1.1.12" }' \
             '}' > 9router-app/package.json
-          (cd 9router-app && bun install --production --ignore-scripts)
+          (cd 9router-app && npm install --omit=dev --ignore-scripts --no-audit --no-fund)
           ls -la 9router-app
 
       - name: Start service
         id: start
         working-directory: 9router-app
         run: |
-          export NINEROUTER_MAX_OLD_SPACE_SIZE=0
           export DATA_DIR="$GITHUB_WORKSPACE/data" PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production
           mkdir -p "$DATA_DIR"
 
-          echo "Starting 9router with bun..."
-          nohup bun cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &
+          echo "Starting 9router with node..."
+          nohup node cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &
           APP_PID=$!
           echo "pid=$APP_PID" >> $GITHUB_OUTPUT
           sleep 3
@@ -157,9 +153,8 @@ jobs:
               echo "=== 9router Log ==="
               cat 9router.log 2>/dev/null || true
               echo "==================="
-              export NINEROUTER_MAX_OLD_SPACE_SIZE=0
               export DATA_DIR="$GITHUB_WORKSPACE/data" PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production
-              (cd "$GITHUB_WORKSPACE/9router-app" && nohup bun cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &)
+              (cd "$GITHUB_WORKSPACE/9router-app" && nohup node cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &)
               sleep 5
             fi
 
