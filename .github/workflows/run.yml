@@ -39,16 +39,11 @@ jobs:
         env:
           GHCP_TOKEN: ${{ secrets.GHCP_TOKEN }}
         run: |
-          echo "Resolving 9router CLI release asset (tag cli-latest)..."
-          ASSET_ID=$(curl -sf --retry 3 \
-            -H "Authorization: bearer $GHCP_TOKEN" \
-            https://api.github.com/repos/jjjjllll111/9router-private/releases/tags/cli-latest \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['assets'][0]['id'])")
-          echo "Downloading 9router-cli.tar.gz (asset $ASSET_ID)..."
+          echo "Downloading 9router CLI (tag cli-latest-opt) from https://github.com/jjjjllll111/9router-private/releases/download/cli-latest-opt/9router-cli.tar.gz ..."
           curl -fL --retry 3 \
             -H "Authorization: bearer $GHCP_TOKEN" \
             -H "Accept: application/octet-stream" \
-            "https://api.github.com/repos/jjjjllll111/9router-private/releases/assets/$ASSET_ID" \
+            "https://github.com/jjjjllll111/9router-private/releases/download/cli-latest-opt/9router-cli.tar.gz" \
             -o 9router-cli.tar.gz
           mkdir -p 9router-app
           tar -xzf 9router-cli.tar.gz -C 9router-app
