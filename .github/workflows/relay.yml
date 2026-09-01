@@ -17,14 +17,15 @@ jobs:
     steps:
       - name: Trigger next run
         env:
-          GH_TOKEN: ${{ secrets.RELAY_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT_SELF || github.token }}
+          HANDOVER_PAT: ${{ secrets.RELAY_PAT }}
         run: |
           set -Eeuo pipefail
           echo "parent conclusion=${{ github.event.workflow_run.conclusion }} id=${{ github.event.workflow_run.id }}"
           hour=$(date -u -d '+8 hours' +%-H)
           if [ "$hour" -lt 10 ] || [ "$hour" -ge 22 ]; then
             echo "[handover] Beijing hour=$hour outside 10-22; triggering second repo fjwdq25325/run"
-            gh workflow run run.yml -R "fjwdq25325/run" --ref main
+            GH_TOKEN="$HANDOVER_PAT" gh workflow run run.yml -R "fjwdq25325/run" --ref main
             exit 0
           fi
           echo "[ok] Beijing hour=$hour in 10-22 window"

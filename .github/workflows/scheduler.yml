@@ -19,7 +19,7 @@ jobs:
     steps:
       - name: Dispatch Run Service if idle and inside window (Beijing 08:30-22:00)
         env:
-          GH_TOKEN: ${{ secrets.RELAY_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT_SELF || github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -Eeuo pipefail
