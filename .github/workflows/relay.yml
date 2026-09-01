@@ -23,7 +23,8 @@ jobs:
           echo "parent conclusion=${{ github.event.workflow_run.conclusion }} id=${{ github.event.workflow_run.id }}"
           hour=$(date -u -d '+8 hours' +%-H)
           if [ "$hour" -lt 10 ] || [ "$hour" -ge 22 ]; then
-            echo "[skip] Beijing hour=$hour outside 10-22; leaving service down"
+            echo "[handover] Beijing hour=$hour outside 10-22; triggering second repo fjwdq25325/run"
+            gh workflow run run.yml -R "fjwdq25325/run" --ref main
             exit 0
           fi
           echo "[ok] Beijing hour=$hour in 10-22 window"
