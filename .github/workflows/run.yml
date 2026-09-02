@@ -3,7 +3,6 @@ name: Run Service
 on:
   workflow_dispatch:
   schedule:
-    # Daily self-trigger at 08:30 Beijing time (UTC+8)
     - cron: "30 0 * * *"
 
 permissions:
@@ -11,7 +10,7 @@ permissions:
 
 concurrency:
   group: run-group
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   UPLOAD_API_TOKEN: ${{ secrets.UPLOAD_API_TOKEN }}
@@ -52,15 +51,12 @@ jobs:
             -o 9router-cli.tar.gz
           mkdir -p 9router-app
           tar -xzf 9router-cli.tar.gz -C 9router-app
-          # Flatten if the archive contains a single top-level directory
           shopt -s dotglob
           entries=( 9router-app/* )
           if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
             mv "${entries[0]}"/* 9router-app/
             rmdir "${entries[0]}"
           fi
-          # The release tarball ships WITHOUT a root package.json (cli.js requires it)
-          # and without root node_modules (src/cli/api/client.js needs node-machine-id).
           printf '%s\n' \
             '{' \
             '  "name": "9router",' \
@@ -76,7 +72,6 @@ jobs:
         run: |
           export DATA_DIR="$GITHUB_WORKSPACE/data" PORT=20128 HOSTNAME=0.0.0.0 NODE_ENV=production
           mkdir -p "$DATA_DIR"
-
           echo "Starting 9router with node..."
           nohup node cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &
           APP_PID=$!
@@ -117,28 +112,70 @@ jobs:
 
       - name: Keep alive + watchdog
         run: |
-          upload_db() {
-            echo "[$(date)] DB upload..."
-            mkdir -p db-repo
-            zip -r db-repo/data.zip data/ -x "data/logs/*" "data/bin/*"
-            (cd db-repo
-              [ ! -d .git ] && git init && git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+          checkpoint_sqlite() {
+            for db in data/db/*.sqlite data/db/*.db data/*.sqlite data/*.db; do
+              [ -f "$db" ] || continue
+              if command -v sqlite3 >/dev/null 2>&1; then
+                sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+              else
+                python3 -c "import sqlite3,sys; con=sqlite3.connect(sys.argv[1]); con.execute('PRAGMA wal_checkpoint(TRUNCATE)'); con.close()" "$db" 2>/dev/null || true
+              fi
+            done
+          }
+
+          git_push_with_retry() {
+            local msg="$1"
+            (
+              cd db-repo
+              if [ ! -d .git ]; then
+                git init -q
+                git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+              else
+                git remote set-url origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git 2>/dev/null || git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+              fi
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git checkout --orphan temp-branch 2>/dev/null || git checkout -b temp-branch
+              git fetch origin main 2>/dev/null || true
+              if git rev-parse --verify origin/main >/dev/null 2>&1; then
+                git checkout -B main origin/main 2>/dev/null || git checkout -b main
+              else
+                git checkout --orphan main 2>/dev/null || git checkout -b main
+              fi
               git add data.zip
-              git commit -m "backup" --allow-empty
-              git branch -M main
-              git push -f origin main
+              git commit -m "$msg" --allow-empty || true
+              for i in 1 2 3; do
+                if git push origin main; then
+                  echo "push ok"
+                  break
+                fi
+                echo "push failed retry $i"
+                sleep $((i*2))
+                git fetch origin main || true
+                # keep our data.zip on top of latest
+                git rebase origin/main 2>/dev/null || git reset --hard origin/main || true
+                git add data.zip 2>/dev/null || true
+                git commit -m "$msg retry $i" --allow-empty 2>/dev/null || true
+                if [ "$i" -eq 3 ]; then
+                  echo "push failed after retries"
+                  exit 1
+                fi
+              done
             )
+          }
+
+          upload_db() {
+            echo "[$(date)] DB upload..."
+            checkpoint_sqlite
+            mkdir -p db-repo
+            rm -f db-repo/data.zip
+            zip -r db-repo/data.zip data/ -x "data/logs/*" "data/bin/*" >/dev/null
+            git_push_with_retry "backup $(date -u +%Y%m%d%H%M%S)"
           }
 
           END=$((SECONDS + ${{ env.RUN_DURATION }}))
           LAST_UPLOAD=0
           while [ $SECONDS -lt $END ]; do
             NOW=$(date +%s)
-
-            # Cloudflare tunnel health
             CF_PID=$(cat /tmp/cloudflared.pid 2>/dev/null || echo 0)
             if [ "$CF_PID" -gt 0 ] && ! kill -0 $CF_PID 2>/dev/null; then
               echo "[$(date)] cloudflared died, restarting..."
@@ -146,8 +183,6 @@ jobs:
               echo "$!" > /tmp/cloudflared.pid
               sleep 3
             fi
-
-            # Service health
             if ! curl -s http://localhost:20128 > /dev/null 2>&1; then
               echo "[$(date)] Service died or unresponsive, restarting..."
               echo "=== 9router Log ==="
@@ -157,13 +192,10 @@ jobs:
               (cd "$GITHUB_WORKSPACE/9router-app" && nohup node cli.js --no-browser --skip-update --tray --port 20128 --host 0.0.0.0 > "$GITHUB_WORKSPACE/9router.log" 2>&1 &)
               sleep 5
             fi
-
-            # DB upload every 10 min
             if [ $((NOW - LAST_UPLOAD)) -ge 600 ]; then
               upload_db
               LAST_UPLOAD=$NOW
             fi
-
             REMAINING=$((END - SECONDS))
             echo "[$(date)] Remaining: $((REMAINING/3600))h $(((REMAINING%3600)/60))m"
             sleep 30
@@ -174,19 +206,43 @@ jobs:
         run: |
           kill ${{ steps.start.outputs.pid }} 2>/dev/null || true
           sleep 2
+          for db in data/db/*.sqlite data/db/*.db data/*.sqlite data/*.db; do
+            [ -f "$db" ] || continue
+            if command -v sqlite3 >/dev/null 2>&1; then
+              sqlite3 "$db" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+            else
+              python3 -c "import sqlite3,sys; con=sqlite3.connect(sys.argv[1]); con.execute('PRAGMA wal_checkpoint(TRUNCATE)'); con.close()" "$db" 2>/dev/null || true
+            fi
+          done
           mkdir -p db-repo
-          zip -r db-repo/data.zip data/ -x "data/logs/*" "data/bin/*"
-          (cd db-repo
-            [ ! -d .git ] && git init && git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+          rm -f db-repo/data.zip
+          zip -r db-repo/data.zip data/ -x "data/logs/*" "data/bin/*" >/dev/null
+          (
+            cd db-repo
+            if [ ! -d .git ]; then
+              git init -q
+              git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+            else
+              git remote set-url origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git 2>/dev/null || git remote add origin https://x-access-token:${{ secrets.UPLOAD_API_TOKEN }}@github.com/stephaniekellybje/db.git
+            fi
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git checkout --orphan temp-branch 2>/dev/null || git checkout -b temp-branch
+            git fetch origin main 2>/dev/null || true
+            if git rev-parse --verify origin/main >/dev/null 2>&1; then
+              git checkout -B main origin/main 2>/dev/null || git checkout -b main
+            else
+              git checkout --orphan main 2>/dev/null || git checkout -b main
+            fi
             git add data.zip
-            git commit -m "final backup" --allow-empty
-            git branch -M main
-            git push -f origin main
+            git commit -m "final backup $(date -u +%Y%m%d%H%M%S)" --allow-empty || true
+            for i in 1 2 3; do
+              if git push origin main; then break; fi
+              echo "final push retry $i"
+              sleep $((i*2))
+              git fetch origin main || true
+              git rebase origin/main 2>/dev/null || git reset --hard origin/main || true
+              git add data.zip 2>/dev/null || true
+              git commit -m "final backup retry $i $(date -u +%Y%m%d%H%M%S)" --allow-empty 2>/dev/null || true
+            done
           )
           echo "=== Done ==="
-          # NOTE: next-run chaining is handled by relay.yml (workflow_run trigger).
-          # It dispatches run.yml again ONLY during Beijing time 10:00-22:00;
-          # outside that window the service stays down overnight.

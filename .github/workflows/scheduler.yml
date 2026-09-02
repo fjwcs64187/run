@@ -37,8 +37,8 @@ jobs:
             exit 0
           fi
 
-          # Skip if anything is already running or queued
-          active=$(gh api "repos/$REPO/actions/runs?per_page=1" \
+          # Skip if anything is already running or queued (per_page=20 fixes missed in_progress)
+          active=$(gh api "repos/$REPO/actions/runs?per_page=20" \
             --jq '[.workflow_runs[] | select(.status == "in_progress" or .status == "queued" or .status == "pending")] | length')
           echo "[tick] active/queued/pending runs: $active"
           if [ "$active" -ne 0 ]; then
